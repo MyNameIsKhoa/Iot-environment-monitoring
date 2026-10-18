@@ -1,0 +1,19 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "devices": {
+      "warehouse01": {
+        "latest": {
+          ".read": "auth != null && auth.uid === 'WoUMKEqE90QejJiyfgCRxRbVDHt1'",
+          ".write": "auth != null && auth.uid === 'UYeyVdMbc3hf7HrtjUBpVvJmqcq2'"
+        },
+        "logs": {
+          ".read": "auth != null && auth.uid === 'WoUMKEqE90QejJiyfgCRxRbVDHt1'",
+          ".write": "auth != null && auth.uid === 'UYeyVdMbc3hf7HrtjUBpVvJmqcq2'",
+          ".indexOn": ["timestamp"]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#123a36"><title>Warehouse Monitor · ESP8266</title>
+  <link rel="stylesheet" href="./style.css?v=20261018-5">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-icon">W</span><div><strong>WAREHOUSE</strong><small>MONITOR / ESP8266</small></div></div>
+      <nav aria-label="Điều hướng"><a href="#overview" class="active">Tổng quan</a><a href="#trends">Xu hướng</a><a href="#history">Lịch sử</a><a href="#events">Sự kiện</a></nav>
+      <div class="rail-foot"><span class="live-dot"></span><span id="modeLabel">Đang kết nối</span><small>Mức bụi chỉ so với mốc lúc khởi động, chưa phải PM2.5.</small></div>
+    </aside>
+    <main>
+      <header class="topbar"><div><span class="eyebrow">GIÁM SÁT MÔI TRƯỜNG KHO</span><h1>Trạm giám sát <em>ESP8266</em></h1><p>Một bo đo cảm biến, báo động tại chỗ và gửi Firebase.</p></div><div class="top-actions"><span id="connection" class="chip">Đang khởi tạo</span><button id="logoutButton" class="action-link hidden" type="button">Đăng xuất</button></div></header>
+      <section id="authPanel" class="auth-panel hidden" aria-label="Đăng nhập"><h2>Đăng nhập người xem</h2><p>Dùng tài khoản Firebase Authentication có UID được cấp quyền đọc trong rules.</p><form id="loginForm"><label>Email<input id="email" type="email" required autocomplete="username"></label><label>Mật khẩu<input id="password" type="password" required autocomplete="current-password"></label><button type="submit">Đăng nhập</button></form><p id="loginError" role="alert"></p></section>
+      <section id="overview" class="section"><div class="section-title"><div><span class="eyebrow">01 / TRẠNG THÁI HIỆN TẠI</span><h2>Không khí trong kho</h2></div><span id="updatedAt" class="muted">Chưa có dữ liệu</span></div>
+        <div class="hero-grid"><div class="status-card"><div class="card-kicker">TRẠNG THÁI ESP8266</div><div id="statusValue" class="status-value">ĐANG CHỜ</div><p id="statusDetail">Chờ dữ liệu từ Firebase.</p><div class="status-footer"><span id="nodeBadge">Thiết bị: chưa rõ</span><span id="gatewayBadge">Wi-Fi: chưa rõ</span></div></div>
+          <div id="metrics" class="metrics"><article class="metric"><span class="metric-icon warm">°</span><span>NHIỆT ĐỘ</span><strong id="temperature">—</strong><small>Độ C (°C)</small></article><article class="metric"><span class="metric-icon cool">%</span><span>ĐỘ ẨM</span><strong id="humidity">—</strong><small id="humidityDetail">Phần trăm (%) · cảnh báo ngoài 40–80%</small></article><article class="metric"><span class="metric-icon dust">≋</span><span>MỨC BỤI TƯƠNG ĐỐI</span><strong id="dust">—</strong><small id="dustDetail">ADC thô: —</small></article><article class="metric"><span class="metric-icon dust">PM</span><span>PM2.5</span><strong>Chưa đo</strong><small>Cảm biến không phân loại kích thước PM2.5</small></article><article class="metric"><span class="metric-icon dust">μ</span><span>NỒNG ĐỘ BỤI</span><strong>— μg/m³</strong><small>Chưa hiệu chuẩn với thiết bị chuẩn</small></article></div></div>
+        <div id="humidityWarning" class="humidity-alert hidden" role="status"></div>
+        <div class="note"><strong>Lưu ý đo bụi</strong><span>GP2Y1014AU0F chỉ đang cung cấp ADC/mức bụi tương đối. Không thể báo PM2.5 hoặc nồng độ μg/m³ chính xác nếu chưa hiệu chuẩn và đối chiếu với thiết bị đo chuẩn.</span></div>
+      </section>
+      <section id="trends" class="section"><div class="section-title"><div><span class="eyebrow">02 / DIỄN BIẾN</span><h2>Xu hướng & thống kê</h2></div><div class="controls"><label for="range">Khoảng xem</label><select id="range"><option value="1">1 giờ</option><option value="6" selected>6 giờ</option><option value="24">1 ngày</option><option value="168">1 tuần</option><option value="720">1 tháng</option></select><label for="metric">Chỉ số</label><select id="metric"><option value="temperatureC">Nhiệt độ</option><option value="humidityPct">Độ ẩm</option><option value="dustAdc">Bụi ADC thô</option><option value="dustDeltaAdc">Chênh lệch bụi ΔADC</option></select></div></div>
+        <div class="chart-card"><div class="chart-head"><strong id="chartTitle">Nhiệt độ</strong><span id="chartCount" class="muted"></span></div><div id="chart" class="chart" role="img" aria-label="Biểu đồ thời gian"></div><div class="chart-axis"><span id="chartStart"></span><span id="chartTick1" class="chart-mid"></span><span id="chartTick2" class="chart-mid"></span><span id="chartTick3" class="chart-mid"></span><span id="chartEnd"></span></div></div>
+        <div class="stat-grid"><article><span>THẤP NHẤT</span><strong id="statMin">—</strong></article><article><span>CAO NHẤT</span><strong id="statMax">—</strong></article><article><span>TRUNG BÌNH</span><strong id="statAvg">—</strong></article><article><span>SỐ MẪU HỢP LỆ</span><strong id="statCount">—</strong></article></div>
+      </section>
+      <section id="history" class="section"><div class="section-title"><div><span class="eyebrow">03 / NHẬT KÝ ĐO</span><h2>Lịch sử</h2></div><div class="controls"><label for="historyDate">Ngày</label><input id="historyDate" type="date"><label for="historyStatus">Trạng thái</label><select id="historyStatus"><option value="ALL">Tất cả</option><option value="SAFE">An toàn</option><option value="DANGER">Nguy hiểm</option><option value="ERROR">Lỗi cảm biến</option><option value="CALIBRATING">Đang hiệu chuẩn</option><option value="PARTIAL">Thiếu cảm biến bụi</option></select><button id="exportCsv" type="button">Xuất CSV trang đã tải</button></div></div><p id="historyHint" class="muted">Mỗi lần tải tối đa 50 bản ghi.</p><div class="table-wrap"><table><thead><tr><th>Thời điểm</th><th>Nhiệt độ</th><th>Độ ẩm</th><th>Bụi / ΔADC</th><th>Trạng thái</th></tr></thead><tbody id="historyRows"></tbody></table></div><button id="loadMore" class="more" type="button">Tải thêm 50 bản ghi</button></section>
+      <section id="events" class="section"><div class="section-title"><div><span class="eyebrow">04 / CẢNH BÁO</span><h2>Chuyển trạng thái gần đây</h2></div><span class="muted">Rút từ 100 log mới nhất</span></div><div id="eventList" class="events"></div></section>
+      <footer>WAREHOUSE MONITOR · Dữ liệu chỉ phục vụ giám sát và trình diễn.</footer>
+    </main>
+  </div>
+  <script type="module" src="./app.js?v=20261018-5"></script>
+</body>
+</html>

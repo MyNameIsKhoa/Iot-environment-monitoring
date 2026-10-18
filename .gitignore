@@ -1,0 +1,4 @@
+warehouse_monitor_esp8266/secrets.h
+src/secrets.h
+.pio/
+mobile/

@@ -1,0 +1,12 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "devices": {
+      "warehouse01": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    }
+  }
+}
