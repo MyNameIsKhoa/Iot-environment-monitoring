@@ -8,7 +8,12 @@
   D5 GPIO14 -> DHT22 DATA (DHT module powered at 3V3)
   D6 GPIO12 -> NPN Q1 base resistor -> GP2Y1014AU0F LED drive
   D7 GPIO13 -> NPN Q2 base resistor -> active 5V buzzer
+  D0 GPIO16 <- MP-2 module DO (use a divider if DO can output over 3.3V)
   A0 -> GP2Y Vo through 47k/10k external attenuator (VERIFY ADC range)
+  D4 GPIO2 -> fan relay IN1 (ACTIVE LOW, verify module accepts 3V3 signals)
+  D3 GPIO0 -> momentary mute button -> GND (INPUT_PULLUP)
+  NOTE: D3/GPIO0 must stay HIGH during boot; do NOT hold button while powering/resetting.
+  NOTE: D4/GPIO2 must also stay HIGH during boot; relay may pulse during reset.
 
   Dependencies: ESP8266 board core, DHT sensor library by Adafruit,
   Adafruit Unified Sensor, LiquidCrystal_I2C (API lcd.init()), ArduinoJson v7.
@@ -39,7 +44,7 @@ const uint8_t LCD_ADDRESS = 0x27;  // Confirmed with your I2C scanner.
 const float TEMP_ALARM_ON_C = 35.0f;
 const float TEMP_ALARM_OFF_C = 33.5f;  // Hysteresis avoids rapid on/off.
 // Humidity alarm thresholds are editable here. Alarm clears with 2% hysteresis.
-const float HUMIDITY_ALARM_HIGH_PCT = 80.0f;
+const float HUMIDITY_ALARM_HIGH_PCT = 86.0f;
 const float HUMIDITY_ALARM_HIGH_CLEAR_PCT = 78.0f;
 const float HUMIDITY_ALARM_LOW_PCT = 40.0f;
 const float HUMIDITY_ALARM_LOW_CLEAR_PCT = 42.0f;
@@ -49,16 +54,40 @@ const uint16_t DUST_LEVEL_MEDIUM_DELTA_ADC = 15; // DEMO ONLY: LOW below this, M
 const uint16_t DUST_ALARM_ON_DELTA_ADC = 35; // DEMO ONLY: HIGH/ALARM after this.
 const uint16_t DUST_ALARM_OFF_DELTA_ADC = 20;
 const uint16_t DUST_MIN_PLAUSIBLE_ADC = 5; // Quick disconnected-sensor indication only.
+// MP-2 module DO is usually LOW when its adjustable comparator detects gas/smoke.
+// Set to HIGH if your specific module has the opposite output polarity.
+const bool ENABLE_SMOKE_SENSOR = true;
+const uint8_t SMOKE_DO_ALARM_LEVEL = LOW;
 
 // Timing
 const unsigned long SAMPLE_INTERVAL_MS = 2500UL;
 const unsigned long UPLOAD_INTERVAL_MS = 15000UL;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 15000UL;
 const unsigned long TOKEN_VALID_MS = 50UL * 60UL * 1000UL;
+// MUTE_BUTTON: press during alarm to silence buzzer temporarily.
+// Change 60000UL to 30000UL (30 seconds) or 120000UL (2 minutes).
+const unsigned long BUZZER_MUTE_DURATION_MS = 60000UL;
+const unsigned long MUTE_BUTTON_DEBOUNCE_MS = 250UL;
+// Fan turns ON only on a TEMPERATURE alarm; no fan activation on dust/humidity.
+// This is a DEMO fan, not a certified smoke-extraction system.
+const bool ENABLE_FAN_RELAY = true;
+const uint8_t FAN_RELAY_ACTIVE_LEVEL = LOW; // Most 5V 4-channel modules are active-LOW.
+
+// Active buzzer pattern: three short beeps, then a short pause; non-blocking.
+const unsigned long BUZZER_CYCLE_MS = 1500UL;
+const unsigned long BUZZER_BEEP_1_END_MS = 160UL;
+const unsigned long BUZZER_BEEP_2_START_MS = 300UL;
+const unsigned long BUZZER_BEEP_2_END_MS = 460UL;
+const unsigned long BUZZER_BEEP_3_START_MS = 600UL;
+const unsigned long BUZZER_BEEP_3_END_MS = 760UL;
 
 const uint8_t PIN_DHT = D5;
 const uint8_t PIN_DUST_LED = D6;
 const uint8_t PIN_BUZZER = D7;
+const uint8_t PIN_FAN_RELAY = D4;   // GPIO2, ESP8266 boot strap HIGH.
+const uint8_t PIN_MUTE_BUTTON = D3; // GPIO0, ESP8266 boot strap HIGH.
+const uint8_t PIN_SMOKE_DO = D0;    // GPIO16, digital MP-2 module output.
+
 const char* AUTH_CACHE_FILE = "/firebase_auth.json";
 
 DHT dht(PIN_DHT, DHT22);
@@ -77,6 +106,8 @@ bool tempAlarm = false;
 bool humidityHighAlarm = false;
 bool humidityLowAlarm = false;
 bool dustAlarm = false;
+bool smokeDetected = false;
+bool smokeDoHigh = true;
 bool filesystemOK = false;
 
 unsigned long lastSampleMs = 0;
@@ -86,6 +117,77 @@ unsigned long tokenIssuedMs = 0;
 String idToken;
 String refreshToken;
 String firebaseUid;
+bool buzzerAlarmWasActive = false;
+bool buzzerOutputOn = false;
+unsigned long buzzerCycleStartedMs = 0;
+// IRQ remembers even a short press while HTTPS is processing. It is intentionally
+// tiny: no Serial, delay, String or GPIO operations inside the ISR.
+volatile bool muteButtonInterruptPending = false;
+bool muteButtonHasAcceptedPress = false;
+unsigned long lastMuteButtonAcceptedMs = 0;
+bool buzzerMuteActive = false;
+unsigned long buzzerMuteStartedMs = 0;
+bool fanOutputOn = false;
+
+void ICACHE_RAM_ATTR onMuteButtonFalling() {
+  muteButtonInterruptPending = true;
+}
+
+bool anyAlarmActive() {
+  return tempAlarm || humidityHighAlarm || humidityLowAlarm || dustAlarm || smokeDetected;
+}
+
+bool isBuzzerMuted(unsigned long now) {
+  if (buzzerMuteActive && (unsigned long)(now - buzzerMuteStartedMs) >= BUZZER_MUTE_DURATION_MS) {
+    buzzerMuteActive = false;
+    Serial.println(F("BUZZER MUTE: expired; alarm may sound again"));
+  }
+  return buzzerMuteActive;
+}
+
+unsigned long buzzerMuteSecondsRemaining(unsigned long now) {
+  if (!isBuzzerMuted(now)) return 0;
+  unsigned long elapsed = (unsigned long)(now - buzzerMuteStartedMs);
+  return (BUZZER_MUTE_DURATION_MS - elapsed + 999UL) / 1000UL;
+}
+
+void pollMuteButton(unsigned long now) {
+  noInterrupts();
+  bool pending = muteButtonInterruptPending;
+  muteButtonInterruptPending = false;
+  interrupts();
+  if (!pending) return;
+  if (muteButtonHasAcceptedPress &&
+      (unsigned long)(now - lastMuteButtonAcceptedMs) < MUTE_BUTTON_DEBOUNCE_MS) return;
+
+  muteButtonHasAcceptedPress = true;
+  lastMuteButtonAcceptedMs = now;
+  if (!anyAlarmActive()) {
+    Serial.println(F("MUTE BUTTON: pressed, but no alarm is active"));
+    return;
+  }
+
+  // A second press starts a NEW 60-second mute period.
+  buzzerMuteActive = true;
+  buzzerMuteStartedMs = now;
+  digitalWrite(PIN_BUZZER, LOW); // immediately silence once main loop can run
+  buzzerOutputOn = false;
+  buzzerAlarmWasActive = false;
+  Serial.printf("MUTE BUTTON: buzzer silent for %lu sec. Fan still automatic.\n",
+                BUZZER_MUTE_DURATION_MS / 1000UL);
+  // statusText() remains DANGER while the physical alarm still exists.
+}
+
+void updateFanRelay() {
+  const bool shouldRun = ENABLE_FAN_RELAY && tempAlarm;
+  if (shouldRun == fanOutputOn) return;
+  digitalWrite(PIN_FAN_RELAY,
+               shouldRun ? FAN_RELAY_ACTIVE_LEVEL : (FAN_RELAY_ACTIVE_LEVEL == LOW ? HIGH : LOW));
+  fanOutputOn = shouldRun;
+  Serial.println(shouldRun ? F("FAN RELAY: ON (temperature alarm)")
+                           : F("FAN RELAY: OFF"));
+}
+
 
 // GP2Y LED drive circuit MUST match the NPN circuit described in README.
 uint16_t readDustAdc() {
@@ -103,10 +205,10 @@ uint16_t readDustAdc() {
 }
 
 const char* statusText() {
-  if (tempAlarm || humidityHighAlarm || humidityLowAlarm || dustAlarm) return "DANGER";
+  if (tempAlarm || humidityHighAlarm || humidityLowAlarm || dustAlarm || smokeDetected) return "DANGER";
   if (!dhtOK || (ENABLE_DUST_SENSOR && !dustOK)) return "ERROR";
   if (ENABLE_DUST_SENSOR && !dustCalibrated) return "CALIBRATING";
-  if (!ENABLE_DUST_SENSOR) return "PARTIAL"; // Dust is off: cannot claim all sensors are safe.
+  if (!ENABLE_DUST_SENSOR || !ENABLE_SMOKE_SENSOR) return "PARTIAL";
   return "SAFE";
 }
 
@@ -138,20 +240,61 @@ const char* dustLabelLcd() {
 }
 
 void showLcd() {
-  // Exactly one screen: 2 rows x 16 characters, no page changes or lcd.clear().
+  // Keep temperature/humidity on row 1; alternate dust and smoke on row 2.
   // Row 1: T:30.0C H:60%
-  // Row 2: B:NHIEU S:DANGER (16 chars)
+  // Row 2: KHOI:CO S:DANGER (16 chars) / B:NHIEU S:DANGER
   String top = dhtOK
       ? String("T:") + String(temperatureC, 1) + "C H:" + String(humidityPct, 0) + "%"
       : String("T:ERR H:ERR");
   String state = statusText();
   if (state == "CALIBRATING") state = "CAL"; // Fit within 16 characters.
-  String bottom = String("B:") + dustLabelLcd() + " S:" + state;
+  static bool showSmokePage = false;
+  showSmokePage = !showSmokePage;
+  String bottom = showSmokePage
+      ? String("KHOI:") + (smokeDetected ? "CO" : "OK") + " S:" + state
+      : String("B:") + dustLabelLcd() + " S:" + state;
   lcdLine(0, top);
   lcdLine(1, bottom);
 }
 
+void updateBuzzer(unsigned long now) {
+  const bool alarmActive = anyAlarmActive();
+  // During mute: preserve DANGER and run fan normally, but force buzzer LOW.
+  if (isBuzzerMuted(now)) {
+    buzzerAlarmWasActive = false; // restart triple-beep pattern after mute expires
+    if (buzzerOutputOn) digitalWrite(PIN_BUZZER, LOW);
+    buzzerOutputOn = false;
+    return;
+  }
+  if (!alarmActive) {
+    buzzerAlarmWasActive = false;
+    if (buzzerOutputOn) {
+      digitalWrite(PIN_BUZZER, LOW);
+      buzzerOutputOn = false;
+    }
+    return;
+  }
+
+  if (!buzzerAlarmWasActive) {
+    buzzerAlarmWasActive = true;
+    buzzerCycleStartedMs = now;  // Start the first beep immediately.
+  }
+
+  const unsigned long phase = (now - buzzerCycleStartedMs) % BUZZER_CYCLE_MS;
+  const bool shouldBeOn = phase < BUZZER_BEEP_1_END_MS ||
+      (phase >= BUZZER_BEEP_2_START_MS && phase < BUZZER_BEEP_2_END_MS) ||
+      (phase >= BUZZER_BEEP_3_START_MS && phase < BUZZER_BEEP_3_END_MS);
+  if (shouldBeOn != buzzerOutputOn) {
+    digitalWrite(PIN_BUZZER, shouldBeOn ? HIGH : LOW);
+    buzzerOutputOn = shouldBeOn;
+  }
+}
+
 void updateSensors() {
+  smokeDoHigh = digitalRead(PIN_SMOKE_DO) == HIGH;
+  smokeDetected = ENABLE_SMOKE_SENSOR &&
+      smokeDoHigh == (SMOKE_DO_ALARM_LEVEL == HIGH);
+
   // Dust readings are relative, NOT calibrated PM2.5 (ug/m3).
   if (ENABLE_DUST_SENSOR) {
     dustAdc = readDustAdc();
@@ -197,8 +340,9 @@ void updateSensors() {
     humidityLowAlarm = false;
   }
 
-  // A failed sensor is ERROR, not SAFE. Buzzer sounds on validated threshold alerts.
-  digitalWrite(PIN_BUZZER, (tempAlarm || humidityHighAlarm || humidityLowAlarm || dustAlarm) ? HIGH : LOW);
+  // Fan reacts only to temperature alarm, even when buzzer is muted.
+  updateFanRelay();
+  // A failed sensor is ERROR, not SAFE. The loop drives a triple-beep alarm pattern.
   showLcd();
 
   Serial.print(F("T="));
@@ -213,9 +357,14 @@ void updateSensors() {
     Serial.print(static_cast<int>(dustAdc) - static_cast<int>(dustBaselineAdc));
   }
   Serial.print(F(" DustLevel=")); Serial.print(dustLevelText());
+  Serial.print(F(" Smoke=")); Serial.print(smokeDetected ? F("DETECTED") : F("CLEAR"));
+  Serial.print(F(" SmokeDO="));
+  Serial.print(smokeDoHigh ? F("HIGH") : F("LOW"));
   Serial.print(F(" HumidityAlarm="));
   Serial.print(humidityHighAlarm ? F("HIGH") : humidityLowAlarm ? F("LOW") : F("OFF"));
   Serial.print(F(" Status=")); Serial.print(statusText());
+  Serial.print(F(" Fan=")); Serial.print(fanOutputOn ? F("ON") : F("OFF"));
+  Serial.print(F(" MuteRemainingSec=")); Serial.print(buzzerMuteSecondsRemaining(millis()));
   Serial.print(F(" WiFi="));
   Serial.println(WiFi.status() == WL_CONNECTED ? F("ON") : F("OFF"));
 }
@@ -358,6 +507,11 @@ void uploadToFirebase() {
   data["humidityHighThresholdPct"] = HUMIDITY_ALARM_HIGH_PCT;
   data["humidityLowThresholdPct"] = HUMIDITY_ALARM_LOW_PCT;
   data["dustAlarm"] = dustAlarm;
+  data["smokeDetected"] = smokeDetected;
+  data["smokeDoHigh"] = smokeDoHigh;
+  data["fanOn"] = fanOutputOn;
+  data["buzzerMuted"] = isBuzzerMuted(millis());
+  data["buzzerMuteRemainingSec"] = buzzerMuteSecondsRemaining(millis());
   data["status"] = statusText();
   data["wifiRssiDbm"] = WiFi.RSSI();
   data["timestamp"][".sv"] = "timestamp"; // Server-side UNIX time in ms.
@@ -397,8 +551,15 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println(F("Warehouse monitor starting..."));
+  // D4 GPIO2 MUST stay HIGH for a normal ESP8266 boot.
+  digitalWrite(PIN_FAN_RELAY, FAN_RELAY_ACTIVE_LEVEL == LOW ? HIGH : LOW);
+  pinMode(PIN_FAN_RELAY, OUTPUT);
+  // D3 GPIO0 MUST stay HIGH at boot. Pressing during power-up enters flashing mode.
+  pinMode(PIN_MUTE_BUTTON, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_MUTE_BUTTON), onMuteButtonFalling, FALLING);
   pinMode(PIN_DUST_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_SMOKE_DO, INPUT); // GPIO16 has no internal pull-up; use a driven module DO output.
   digitalWrite(PIN_DUST_LED, LOW);
   digitalWrite(PIN_BUZZER, LOW);
 
@@ -444,6 +605,8 @@ if (WiFi.status() == WL_CONNECTED) {
 
 void loop() {
   unsigned long now = millis();
+  pollMuteButton(now);
+  isBuzzerMuted(now); // automatically expire a 60-second mute
   if (WiFi.status() != WL_CONNECTED && now - lastWiFiTryMs >= WIFI_RETRY_INTERVAL_MS) {
     WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -457,6 +620,10 @@ void loop() {
     lastUploadMs = now;
     uploadToFirebase();
   }
+  // HTTPS uses blocking requests. IRQ latches short presses until loop resumes;
+  // muting can still be delayed while a Firebase request is in progress.
+  pollMuteButton(millis());
+  updateBuzzer(millis());
   delay(10);
 }
 

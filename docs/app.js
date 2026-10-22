@@ -11,7 +11,7 @@ const STATUS = {
   OFFLINE: ['MẤT KẾT NỐI', 'ESP8266 chưa gửi dữ liệu mới.']
 };
 const DUST = {LOW: 'ÍT', MEDIUM: 'VỪA', HIGH: 'NHIỀU', CALIBRATING: 'ĐANG CHỜ', ERROR: 'LỖI', DISABLED: 'ĐÃ TẮT'};
-const METRICS = {temperatureC: ['Nhiệt độ', '°C'], humidityPct: ['Độ ẩm', '%'], dustAdc: ['Tín hiệu bụi', 'ADC'], dustDeltaAdc: ['Bụi so với mốc', 'ΔADC']};
+const METRICS = {temperatureC: ['Nhiệt độ', '°C'], humidityPct: ['Độ ẩm', '%'], dustAdc: ['Tín hiệu bụi', 'ADC'], dustDeltaAdc: ['Bụi so với mốc', 'ΔADC'], smokeDoHigh: ['Tín hiệu khói DO', 'LOW/HIGH']};
 const RANGE_LABELS = {'1': '1 giờ', '6': '6 giờ', '24': '1 ngày', '168': '1 tuần', '720': '1 tháng'};
 let db, auth, sdk, latest = null, history = [], stats = [], recent = [];
 let cursor = null, historyDone = false, busy = false, unsubs = [];
@@ -43,6 +43,7 @@ export function splitAtGaps(values) {
   return segments;
 }
 function yAxis(values, field) {
+  if (field === 'smokeDoHigh') return {lower: 0, upper: 1, labels: ['HIGH', '', '', '', 'LOW']};
   const minimum = Math.min(...values), maximum = Math.max(...values);
   const isAdc = field.startsWith('dust');
   const defaultStep = isAdc ? 5 : field === 'humidityPct' ? 1 : 0.5;
@@ -78,7 +79,7 @@ export function renderOverview() {
   const online = Number.isFinite(ageMs) && ageMs < 45000;
   const s = online ? status(latest.status) : 'OFFLINE';
   $('statusValue').textContent = STATUS[s][0];
-  const alarm = s === 'DANGER' ? `${latest.temperatureAlarm ? 'Nhiệt độ cao. ' : ''}${latest.humidityAlarmHigh ? 'Độ ẩm cao. ' : ''}${latest.humidityAlarmLow ? 'Độ ẩm thấp. ' : ''}${latest.dustAlarm ? 'Bụi tăng mạnh. ' : ''}` : '';
+  const alarm = s === 'DANGER' ? `${latest.temperatureAlarm ? 'Nhiệt độ cao. ' : ''}${latest.humidityAlarmHigh ? 'Độ ẩm cao. ' : ''}${latest.humidityAlarmLow ? 'Độ ẩm thấp. ' : ''}${latest.dustAlarm ? 'Bụi tăng mạnh. ' : ''}${latest.smokeDetected ? 'Phát hiện khói. ' : ''}` : '';
   $('statusDetail').textContent = `${s} · ${alarm}${STATUS[s][1]}${latest && !online ? ' Số đo trên thẻ là dữ liệu cũ.' : ''}`;
   $('statusValue').parentElement.className = `status-card ${s === 'DANGER' ? 'danger' : s === 'SAFE' ? '' : s === 'OFFLINE' ? 'offline' : 'error'}`;
   $('metrics').classList.toggle('stale', !!latest && !online);
@@ -102,6 +103,10 @@ export function renderOverview() {
   $('humidityDetail').classList.toggle('alert', !!humidityWarning);
   $('dust').textContent = latest ? (DUST[latest.dustLevel] || '—') : '—';
   $('dustDetail').textContent = latest?.dustOK ? `ADC: ${val(latest.dustAdc, 0)} · ΔADC: ${val(latest.dustDeltaAdc, 0)}` : 'ADC: —';
+  $('smoke').textContent = latest?.smokeDetected == null ? '—' : latest.smokeDetected ? 'DETECTED' : 'NOT DETECTED';
+  $('smokeDetail').textContent = latest?.smokeDoHigh == null ? 'DO: —' : `DO: ${latest.smokeDoHigh ? 'HIGH' : 'LOW'}`;
+  $('fan').textContent = latest?.fanOn == null ? '—' : latest.fanOn ? 'ON' : 'OFF';
+  $('fanDetail').textContent = latest?.fanOn == null ? 'Trạng thái relay: —' : 'Trạng thái relay';
   $('updatedAt').textContent = latest ? `${online ? 'Cập nhật' : 'Dữ liệu cũ'}: ${formatAge(ageMs)} · ${fmtTime(latest.timestamp)}` : 'Chưa có dữ liệu';
   $('updatedAt').classList.toggle('stale', !!latest && !online);
 }
@@ -109,15 +114,16 @@ function renderStats() {
   const field = $('metric').value, [title, unit] = METRICS[field];
   const since = Date.now() - Number($('range').value) * 3600000;
   const rowsInRange = stats.filter(r => r.timestamp >= since);
-  const values = rowsInRange.filter(r => field.startsWith('dust') ? r.dustOK : r.dhtOK)
+  const values = rowsInRange.filter(r => field === 'smokeDoHigh' ? r.smokeDoHigh != null : field.startsWith('dust') ? r.dustOK : r.dhtOK)
     .map(r => ({t: Number(r.timestamp), v: r[field] == null ? NaN : Number(r[field])}))
     .filter(x => Number.isFinite(x.v) && Number.isFinite(x.t));
   $('chartTitle').textContent = `${title} · ${unit}`;
   $('chartCount').textContent = `${values.length}/${rowsInRange.length} mẫu hợp lệ trong ${RANGE_LABELS[$('range').value] || 'khoảng đã chọn'} (tối đa ${Number($('range').value) >= 168 ? '5.000' : '1.500'} bản ghi gần nhất)`;
   $('statCount').textContent = String(values.length);
-  $('statMin').textContent = values.length ? `${val(Math.min(...values.map(x => x.v)))} ${unit}` : '—';
-  $('statMax').textContent = values.length ? `${val(Math.max(...values.map(x => x.v)))} ${unit}` : '—';
-  $('statAvg').textContent = values.length ? `${val(values.reduce((sum, x) => sum + x.v, 0) / values.length)} ${unit}` : '—';
+  const stateValue = v => v >= 0.5 ? 'HIGH' : 'LOW';
+  $('statMin').textContent = values.length ? (field === 'smokeDoHigh' ? stateValue(Math.min(...values.map(x => x.v))) : `${val(Math.min(...values.map(x => x.v)))} ${unit}`) : '—';
+  $('statMax').textContent = values.length ? (field === 'smokeDoHigh' ? stateValue(Math.max(...values.map(x => x.v))) : `${val(Math.max(...values.map(x => x.v)))} ${unit}`) : '—';
+  $('statAvg').textContent = values.length ? (field === 'smokeDoHigh' ? `HIGH ${val(values.reduce((sum, x) => sum + x.v, 0) / values.length * 100, 0)}%` : `${val(values.reduce((sum, x) => sum + x.v, 0) / values.length)} ${unit}`) : '—';
   $('chartStart').textContent = values.length ? fmtTime(values[0].t) : '';
   $('chartEnd').textContent = values.length ? fmtTime(values.at(-1).t) : '';
   for (let i = 1; i <= 3; i++) $('chartTick' + i).textContent = values.length > 1 ? new Date(values[0].t + (values.at(-1).t - values[0].t) * i / 4).toLocaleTimeString('vi-VN', {hour: '2-digit', minute: '2-digit'}) : '';
@@ -127,7 +133,9 @@ function renderStats() {
   const pointX = p => 2 + (p.t - first) / span * 996;
   const pointY = p => 240 - (p.v - lo) / (hi - lo) * 220;
   const lines = splitAtGaps(values).map(segment => segment.length > 1
-    ? `<polyline points="${segment.map(p => `${pointX(p).toFixed(1)},${pointY(p).toFixed(1)}`).join(' ')}"/>`
+    ? field === 'smokeDoHigh'
+      ? `<path class="chart-step" d="${segment.map((p, i) => `${i ? `H ${pointX(p).toFixed(1)} V ${pointY(p).toFixed(1)}` : `M ${pointX(p).toFixed(1)} ${pointY(p).toFixed(1)}`}`).join(' ')}"/>`
+      : `<polyline points="${segment.map(p => `${pointX(p).toFixed(1)},${pointY(p).toFixed(1)}`).join(' ')}"/>`
     : `<circle class="chart-single" cx="${pointX(segment[0]).toFixed(1)}" cy="${pointY(segment[0]).toFixed(1)}" r="5"/>`).join('');
   const grid = [20, 75, 130, 185, 240].map(y => `<line x1="0" y1="${y}" x2="1000" y2="${y}"/>`).join('');
   $('chart').innerHTML = `<div class="chart-plot"><div class="chart-y-axis" aria-hidden="true">${labels.map(label => `<span>${label}</span>`).join('')}</div><svg viewBox="0 0 1000 260" preserveAspectRatio="none" aria-hidden="true">${grid}${lines}<line class="chart-cursor" y1="20" y2="240" style="display:none"/><circle class="chart-point" r="5" style="display:none"/></svg><div class="chart-tooltip" hidden><strong></strong><small></small></div></div>`;
@@ -145,7 +153,7 @@ function renderStats() {
     const x = pointX(point), y = pointY(point);
     cursor.setAttribute('x1', x); cursor.setAttribute('x2', x); cursor.style.display = '';
     dot.setAttribute('cx', x); dot.setAttribute('cy', y); dot.style.display = '';
-    tooltip.querySelector('strong').textContent = `${val(point.v, field.startsWith('dust') ? 0 : 1)} ${unit}`;
+    tooltip.querySelector('strong').textContent = field === 'smokeDoHigh' ? stateValue(point.v) : `${val(point.v, field.startsWith('dust') ? 0 : 1)} ${unit}`;
     tooltip.querySelector('small').textContent = fmtTime(point.t);
     tooltip.style.left = `${Math.max(82, Math.min(plotRect.width - 82, rect.left - plotRect.left + x / 1000 * rect.width))}px`;
     tooltip.style.top = `${y / 260 * rect.height}px`;
@@ -164,26 +172,26 @@ function renderHistory() {
   for (const r of rows) {
     const tr = document.createElement('tr');
     const dust = r.dustOK ? `${val(r.dustAdc, 0)} ADC · ${val(r.dustDeltaAdc, 0)} ΔADC` : '—';
-    for (const value of [fmtTime(r.timestamp), r.dhtOK ? `${val(r.temperatureC)} °C` : '—', r.dhtOK ? `${val(r.humidityPct)} %` : '—', dust]) {
+    for (const value of [fmtTime(r.timestamp), r.dhtOK ? `${val(r.temperatureC)} °C` : '—', r.dhtOK ? `${val(r.humidityPct)} %` : '—', dust, r.smokeDetected == null ? '—' : r.smokeDetected ? 'DETECTED' : 'NOT DETECTED', r.fanOn == null ? '—' : r.fanOn ? 'ON' : 'OFF']) {
       const td = document.createElement('td'); td.textContent = value; tr.append(td);
     }
     const td = document.createElement('td'), badge = document.createElement('span');
     badge.className = `badge ${status(r.status)}`; badge.textContent = STATUS[status(r.status)][0]; td.append(badge); tr.append(td); body.append(tr);
   }
-  if (!rows.length) { const tr = document.createElement('tr'), td = document.createElement('td'); td.colSpan = 5; td.textContent = 'Chưa có bản ghi phù hợp trong các trang đã tải.'; tr.append(td); body.append(tr); }
+  if (!rows.length) { const tr = document.createElement('tr'), td = document.createElement('td'); td.colSpan = 7; td.textContent = 'Chưa có bản ghi phù hợp trong các trang đã tải.'; tr.append(td); body.append(tr); }
   $('historyHint').textContent = `Đã tải ${history.length} bản ghi; lọc trạng thái và CSV áp dụng trên các trang đã tải.`;
   $('loadMore').disabled = historyDone || busy;
   $('loadMore').textContent = historyDone ? 'Đã hết dữ liệu' : busy ? 'Đang tải…' : 'Tải thêm 50 bản ghi';
 }
 function renderEvents() {
-  const events = recent.filter((r, i) => i && (r.status !== recent[i - 1].status || r.temperatureAlarm !== recent[i - 1].temperatureAlarm || r.dustAlarm !== recent[i - 1].dustAlarm));
+  const events = recent.filter((r, i) => i && (r.status !== recent[i - 1].status || r.temperatureAlarm !== recent[i - 1].temperatureAlarm || r.dustAlarm !== recent[i - 1].dustAlarm || r.smokeDetected !== recent[i - 1].smokeDetected || r.fanOn !== recent[i - 1].fanOn));
   const list = $('eventList'); list.replaceChildren();
   for (const e of events.reverse().slice(0, 20)) {
     const s = status(e.status), article = document.createElement('article');
     const mark = document.createElement('span'); mark.className = `event-mark ${s}`;
     const div = document.createElement('div'), strong = document.createElement('strong'), small = document.createElement('small');
-    strong.textContent = s === 'DANGER' ? `Cảnh báo: ${e.temperatureAlarm ? 'nhiệt độ ' : ''}${e.dustAlarm ? 'bụi ' : ''}` : STATUS[s][0];
-    small.textContent = `${fmtTime(e.timestamp)} · Bụi ${DUST[e.dustLevel] || '—'}`;
+    strong.textContent = s === 'DANGER' ? `Cảnh báo: ${e.temperatureAlarm ? 'nhiệt độ ' : ''}${e.dustAlarm ? 'bụi ' : ''}${e.smokeDetected ? 'khói ' : ''}` : STATUS[s][0];
+    small.textContent = `${fmtTime(e.timestamp)} · Khói ${e.smokeDetected == null ? '—' : e.smokeDetected ? 'DETECTED' : 'NOT DETECTED'} · Quạt ${e.fanOn == null ? '—' : e.fanOn ? 'ON' : 'OFF'}`;
     div.append(strong, small); article.append(mark, div); list.append(article);
   }
   if (!events.length) { const p = document.createElement('p'); p.className = 'muted'; p.textContent = 'Chưa có lần đổi trạng thái trong 100 log gần nhất.'; list.append(p); }
@@ -241,8 +249,8 @@ async function loadStats() {
 function exportCsv() {
   const filter = $('historyStatus').value;
   const rows = history.filter(r => filter === 'ALL' || r.status === filter).sort(rowOrder);
-  const csv = [['timestampUtc','temperatureC','humidityPct','dustAdc','dustBaselineAdc','dustDeltaAdc','dustLevel','status','temperatureAlarm','dustAlarm'],
-    ...rows.map(r => [new Date(r.timestamp).toISOString(), r.dhtOK ? r.temperatureC : '', r.dhtOK ? r.humidityPct : '', r.dustOK ? r.dustAdc : '', r.dustBaselineAdc ?? '', r.dustDeltaAdc ?? '', r.dustLevel, status(r.status), !!r.temperatureAlarm, !!r.dustAlarm])]
+  const csv = [['timestampUtc','temperatureC','humidityPct','dustAdc','dustBaselineAdc','dustDeltaAdc','dustLevel','smokeDetected','smokeDoHigh','fanOn','status','temperatureAlarm','dustAlarm'],
+    ...rows.map(r => [new Date(r.timestamp).toISOString(), r.dhtOK ? r.temperatureC : '', r.dhtOK ? r.humidityPct : '', r.dustOK ? r.dustAdc : '', r.dustBaselineAdc ?? '', r.dustDeltaAdc ?? '', r.dustLevel, r.smokeDetected ?? '', r.smokeDoHigh ?? '', r.fanOn ?? '', status(r.status), !!r.temperatureAlarm, !!r.dustAlarm])]
     .map(row => row.join(',')).join('\r\n');
   const url = URL.createObjectURL(new Blob(['\ufeff', csv], {type: 'text/csv;charset=utf-8'}));
   const a = document.createElement('a'); a.href = url; a.download = 'warehouse01-logs.csv'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
